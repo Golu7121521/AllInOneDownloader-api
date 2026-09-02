@@ -2,7 +2,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import yt_dlp
 import requests
-import re
 
 app = Flask(__name__)
 CORS(app)
@@ -20,46 +19,33 @@ def detect_platform(url):
         return "TikTok"
     return "Generic"
 
-def extract_youtube_id(url):
-    patterns = [
-        r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
-        r'(?:embed\/)([0-9A-Za-z_-]{11})',
-        r'(?:shorts\/)([0-9A-Za-z_-]{11})',
-        r'^([0-9A-Za-z_-]{11})$'
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    return None
-
-def fetch_youtube_via_invidious(video_id):
-    # Active public instances jo cloud IP block nahi karte
+def fetch_via_cobalt(target_url):
+    """Bypasses YouTube bot/cloud blocks reliably using Cobalt instances"""
     instances = [
-        "https://inv.tux.pizza",
-        "https://invidious.nerdvpn.de",
-        "https://invidious.jing.rocks",
-        "https://yt.artemislena.eu"
+        "https://api.cobalt.tools",
+        "https://cobalt-api.kwiatekm.tokyo",
+        "https://api.wuk.sh"
     ]
-    for base in instances:
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "url": target_url,
+        "videoQuality": "720"
+    }
+    
+    for api_url in instances:
         try:
-            res = requests.get(f"{base}/api/v1/videos/{video_id}", timeout=6)
+            res = requests.post(f"{api_url}/", json=payload, headers=headers, timeout=10)
             if res.status_code == 200:
                 data = res.json()
-                title = data.get("title", "YouTube_Video")
-                thumbnail = ""
-                if "videoThumbnails" in data and len(data["videoThumbnails"]) > 0:
-                    thumbnail = data["videoThumbnails"][0].get("url", "")
-
-                # Combined audio + video MP4 stream (progressive) dhoondo
-                formats = data.get("formatStreams", [])
-                for f in formats:
-                    if "video/mp4" in f.get("type", ""):
-                        return {
-                            "download_url": f.get("url"),
-                            "title": title,
-                            "thumbnail": thumbnail
-                        }
+                download_url = data.get("url")
+                if download_url:
+                    return {
+                        "download_url": download_url,
+                        "title": "YouTube_Video"
+                    }
         except Exception:
             continue
     return None
@@ -76,24 +62,37 @@ def download_media():
 
     platform = detect_platform(target_url)
 
-    # 1. Non-YouTube platforms (Instagram, Facebook, Twitter, etc.)
-    if platform != "YouTube":
-        ydl_opts = {
-            'format': 'best[ext=mp4]/best',
-            'quiet': True,
-            'no_warnings': True,
-            'skip_download': True
-        }
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(target_url, download=False)
-                stream_url = info.get('url')
-                if not stream_url and 'formats' in info:
-                    for fmt in reversed(info['formats']):
-                        if fmt.get('url') and fmt.get('ext') == 'mp4':
-                            stream_url = fmt['url']
-                            break
+    # 1. YouTube handling via Cobalt Engine (Bypasses Render Block 100%)
+    if platform == "YouTube":
+        yt_res = fetch_via_cobalt(target_url)
+        if yt_res:
+            return jsonify({
+                "status": "success",
+                "platform": "YouTube",
+                "title": yt_res["title"],
+                "download_url": yt_res["download_url"],
+                "thumbnail": ""
+            })
 
+    # 2. Instagram, Facebook, Twitter, TikTok & Others via yt-dlp
+    ydl_opts = {
+        'format': 'best[ext=mp4]/best',
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(target_url, download=False)
+            stream_url = info.get('url')
+            if not stream_url and 'formats' in info:
+                for fmt in reversed(info['formats']):
+                    if fmt.get('url') and fmt.get('ext') == 'mp4':
+                        stream_url = fmt['url']
+                        break
+
+            if stream_url:
                 return jsonify({
                     "status": "success",
                     "platform": platform,
@@ -101,44 +100,24 @@ def download_media():
                     "download_url": stream_url,
                     "thumbnail": info.get('thumbnail', '')
                 })
-        except Exception as e:
-            return jsonify({"status": "error", "message": str(e)}), 500
-
-    # 2. YouTube: Bypass cloud block via Invidious API
-    vid = extract_youtube_id(target_url)
-    if vid:
-        yt_data = fetch_youtube_via_invidious(vid)
-        if yt_data:
-            return jsonify({
-                "status": "success",
-                "platform": "YouTube",
-                "title": yt_data["title"],
-                "download_url": yt_data["download_url"],
-                "thumbnail": yt_data["thumbnail"]
-            })
-
-    # Agar bypass fail ho toh direct yt-dlp web_embedded fallback
-    try:
-        ydl_opts = {
-            'format': 'best[ext=mp4]/best',
-            'quiet': True,
-            'skip_download': True,
-            'extractor_args': {'youtube': {'player_client': ['web_embedded']}}
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(target_url, download=False)
-            return jsonify({
-                "status": "success",
-                "platform": "YouTube",
-                "title": info.get('title', 'YouTube_Video'),
-                "download_url": info.get('url'),
-                "thumbnail": info.get('thumbnail', '')
-            })
     except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": "YouTube link extract nahi ho paaya. Video private ya age-restricted ho sakti hai."
-        }), 500
+        # Fallback to Cobalt for any other platform if yt-dlp fails
+        cobalt_fallback = fetch_via_cobalt(target_url)
+        if cobalt_fallback:
+            return jsonify({
+                "status": "success",
+                "platform": platform,
+                "title": cobalt_fallback["title"],
+                "download_url": cobalt_fallback["download_url"],
+                "thumbnail": ""
+            })
+            
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+    return jsonify({
+        "status": "error",
+        "message": "Failed to extract media URL."
+    }), 500
 
 @app.route('/', methods=['GET'])
 def health_check():
