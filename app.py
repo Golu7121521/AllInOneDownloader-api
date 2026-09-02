@@ -1,10 +1,9 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import yt_dlp
-import re
 
 app = Flask(__name__)
-CORS(app)  # Mobile app ya Web browser se access allow karne ke liye
+CORS(app)
 
 def detect_platform(url):
     if "instagram.com" in url:
@@ -31,16 +30,20 @@ def download_media():
 
     platform = detect_platform(target_url)
 
-    # yt-dlp configuration for direct progressive video playback
+    # YouTube bypass ke liye Android/iOS client simulate karte hain
     ydl_opts = {
-        'format': 'best[ext=mp4][vcodec^=avc1]/best[ext=mp4]/best',  # Android MediaPlayer compatible H.264 MP4
+        'format': 'best[ext=mp4][vcodec^=avc1]/best[ext=mp4]/best',
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
         'skip_download': True,
-        # Standard mobile user agent to prevent bot verification blocks
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'ios', 'web_safari']
+            }
+        },
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip'
         }
     }
 
@@ -48,10 +51,9 @@ def download_media():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(target_url, download=False)
 
-            # Direct CDN link
             stream_url = info.get('url')
             
-            # If standard url is missing, grab from formats list
+            # Agar primary direct link na mile toh formats list traverse karte hain
             if not stream_url and 'formats' in info:
                 for fmt in reversed(info['formats']):
                     if fmt.get('url') and fmt.get('ext') == 'mp4':
