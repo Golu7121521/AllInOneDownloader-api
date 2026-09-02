@@ -19,33 +19,30 @@ def detect_platform(url):
         return "TikTok"
     return "Generic"
 
-def fetch_via_cobalt(target_url):
-    """Bypasses YouTube bot/cloud blocks reliably using Cobalt instances"""
-    instances = [
-        "https://api.cobalt.tools",
-        "https://cobalt-api.kwiatekm.tokyo",
-        "https://api.wuk.sh"
+def get_youtube_download_url(yt_url):
+    # Working public cobalt API nodes
+    endpoints = [
+        "https://api.cobalt.tools/api/json",
+        "https://cobalt.api.scip.fun/api/json",
+        "https://api.wuk.sh/api/json"
     ]
     headers = {
         "Accept": "application/json",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0"
     }
     payload = {
-        "url": target_url,
-        "videoQuality": "720"
+        "url": yt_url,
+        "vQuality": "720"
     }
-    
-    for api_url in instances:
+
+    for ep in endpoints:
         try:
-            res = requests.post(f"{api_url}/", json=payload, headers=headers, timeout=10)
+            res = requests.post(ep, json=payload, headers=headers, timeout=8)
             if res.status_code == 200:
                 data = res.json()
-                download_url = data.get("url")
-                if download_url:
-                    return {
-                        "download_url": download_url,
-                        "title": "YouTube_Video"
-                    }
+                if "url" in data and data["url"]:
+                    return data["url"]
         except Exception:
             continue
     return None
@@ -62,26 +59,30 @@ def download_media():
 
     platform = detect_platform(target_url)
 
-    # 1. YouTube handling via Cobalt Engine (Bypasses Render Block 100%)
+    # 1. YOUTUBE ROUTE (yt-dlp se bypass karke direct external node se extract)
     if platform == "YouTube":
-        yt_res = fetch_via_cobalt(target_url)
-        if yt_res:
+        yt_stream = get_youtube_download_url(target_url)
+        if yt_stream:
             return jsonify({
                 "status": "success",
                 "platform": "YouTube",
-                "title": yt_res["title"],
-                "download_url": yt_res["download_url"],
+                "title": "YouTube Video",
+                "download_url": yt_stream,
                 "thumbnail": ""
             })
+        else:
+            return jsonify({
+                "status": "error",
+                "message": "YouTube stream couldn't be extracted right now. Try again in a few seconds."
+            }), 500
 
-    # 2. Instagram, Facebook, Twitter, TikTok & Others via yt-dlp
+    # 2. INSTAGRAM / FACEBOOK / TIKTOK / TWITTER ROUTE (yt-dlp works seamlessly)
     ydl_opts = {
         'format': 'best[ext=mp4]/best',
         'quiet': True,
         'no_warnings': True,
         'skip_download': True
     }
-    
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(target_url, download=False)
@@ -96,22 +97,11 @@ def download_media():
                 return jsonify({
                     "status": "success",
                     "platform": platform,
-                    "title": info.get('title', 'Media_Video'),
+                    "title": info.get('title', 'Downloaded_Video'),
                     "download_url": stream_url,
                     "thumbnail": info.get('thumbnail', '')
                 })
     except Exception as e:
-        # Fallback to Cobalt for any other platform if yt-dlp fails
-        cobalt_fallback = fetch_via_cobalt(target_url)
-        if cobalt_fallback:
-            return jsonify({
-                "status": "success",
-                "platform": platform,
-                "title": cobalt_fallback["title"],
-                "download_url": cobalt_fallback["download_url"],
-                "thumbnail": ""
-            })
-            
         return jsonify({"status": "error", "message": str(e)}), 500
 
     return jsonify({
@@ -123,7 +113,7 @@ def download_media():
 def health_check():
     return jsonify({
         "status": "active",
-        "service": "All-in-One Downloader"
+        "service": "All-in-One Downloader API"
     })
 
 if __name__ == '__main__':
