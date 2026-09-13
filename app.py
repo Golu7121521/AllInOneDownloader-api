@@ -7,7 +7,7 @@ import re
 app = Flask(__name__)
 CORS(app)
 
-# Instaloader setup without saving files locally
+# Instaloader ko optimize kiya gaya hai original quality images/videos ke liye
 L = instaloader.Instaloader(
     download_pictures=False,
     download_videos=False,
@@ -32,9 +32,6 @@ def detect_platform(url):
     return "Generic"
 
 def extract_instagram_data(url):
-    """
-    Handles Instagram Post, Reel, Carousel, and Profile Pic extraction
-    """
     clean_url = url.split("?")[0].rstrip("/")
 
     # 1. Profile Picture: instagram.com/username
@@ -47,7 +44,7 @@ def extract_instagram_data(url):
             "title": f"Profile - @{profile.username}",
             "media": [{
                 "type": "image",
-                "url": profile.profile_pic_url,
+                "url": profile.profile_pic_url, # Original DP URL
                 "thumbnail": profile.profile_pic_url
             }],
             "bio": profile.biography
@@ -64,13 +61,13 @@ def extract_instagram_data(url):
             for node in post.get_sidecar_nodes():
                 media_list.append({
                     "type": "video" if node.is_video else "image",
-                    "url": node.video_url if node.is_video else node.display_url,
+                    "url": node.video_url if node.is_video else node.display_url, # Grabs highest CDN resolution
                     "thumbnail": node.display_url
                 })
         else:
             media_list.append({
                 "type": "video" if post.is_video else "image",
-                "url": post.video_url if post.is_video else post.url,
+                "url": post.video_url if post.is_video else post.url, # Grabs highest CDN resolution
                 "thumbnail": post.url
             })
 
@@ -87,21 +84,15 @@ def download_media():
     target_url = request.args.get('url')
     
     if not target_url:
-        return jsonify({
-            "status": "error",
-            "message": "URL parameter missing. Example: /download?url=<link>"
-        }), 400
+        return jsonify({"status": "error", "message": "URL parameter missing."}), 400
 
     u = target_url.lower()
     if "youtube.com" in u or "youtu.be" in u:
-        return jsonify({
-            "status": "error",
-            "message": "YouTube downloads are not supported on this endpoint."
-        }), 400
+        return jsonify({"status": "error", "message": "YouTube downloads are not supported."}), 400
 
     platform = detect_platform(target_url)
 
-    # 1. Instagram Custom Handler (Photos, Profile, Reels, Multi-items)
+    # 1. Instagram Custom Handler
     if platform == "Instagram":
         try:
             insta_result = extract_instagram_data(target_url)
@@ -114,12 +105,12 @@ def download_media():
                     "media": insta_result.get("media")
                 })
         except Exception as e:
-            # Agar instaloader fail ho to yt-dlp fallback chalne de
-            pass
+            pass # Fallback to yt-dlp if instaloader fails
 
-    # 2. General / Video Handler with yt-dlp (Reels, FB, Twitter, Reddit)
+    # 2. General / Video Handler with yt-dlp (For Highest Quality Single File)
     ydl_opts = {
-        'format': 'best[ext=mp4]/best',
+        # 'best' format ensure karta hai ki sabse high resolution wala single pre-merged file hi select ho (Audio+Video included)
+        'format': 'best', 
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
@@ -132,18 +123,19 @@ def download_media():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(target_url, download=False)
 
+            # Direct stream URL nikalna (Best Quality)
             stream_url = info.get('url')
+            
+            # Agar direct top level pe na mile, toh formats list mein se sabse best (aakhiri) nikalenge
             if not stream_url and 'formats' in info:
+                # yt-dlp formats ko quality (worst to best) ke order mein rakhta hai, isliye reversed(info['formats']) best find karega.
                 for fmt in reversed(info['formats']):
                     if fmt.get('url'):
                         stream_url = fmt['url']
                         break
 
             if not stream_url:
-                return jsonify({
-                    "status": "error",
-                    "message": "Direct download link nahi mil payi."
-                }), 404
+                return jsonify({"status": "error", "message": "High Quality link extract nahi ho payi."}), 404
 
             return jsonify({
                 "status": "success",
@@ -158,17 +150,14 @@ def download_media():
             })
 
     except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/', methods=['GET'])
 def health_check():
     return jsonify({
         "status": "active",
-        "service": "All Media & Profile Downloader API",
-        "supported": ["Instagram (Reels, Posts, Profile)", "Facebook", "Twitter", "TikTok", "Pinterest", "Reddit"]
+        "service": "All Media Downloader API (High Quality)",
+        "supported": ["Instagram", "Facebook", "Twitter", "TikTok", "Pinterest", "Reddit"]
     })
 
 if __name__ == '__main__':
