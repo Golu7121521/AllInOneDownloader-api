@@ -7,6 +7,7 @@ import re
 app = Flask(__name__)
 CORS(app)
 
+# Instaloader optimized for original quality without saving files locally
 L = instaloader.Instaloader(
     download_pictures=False,
     download_videos=False,
@@ -20,6 +21,14 @@ def detect_platform(url):
         return "Instagram"
     elif "facebook.com" in u or "fb.watch" in u:
         return "Facebook"
+    elif "twitter.com" in u or "x.com" in u:
+        return "Twitter"
+    elif "tiktok.com" in u:
+        return "TikTok"
+    elif "pin.it" in u or "pinterest.com" in u:
+        return "Pinterest"
+    elif "reddit.com" in u:
+        return "Reddit"
     return "Generic"
 
 def extract_instagram_data(url):
@@ -41,41 +50,50 @@ def extract_instagram_data(url):
             }]
         }
 
-    # 2. Posts, Reels: instagram.com/p/CODE
+    # 2. Posts, Multi-image Posters, Reels: instagram.com/p/CODE or /reel/CODE
     post_match = re.search(r"/(?:p|reel|tv)/([^/?#&]+)", clean_url)
     if post_match:
         shortcode = post_match.group(1)
         post = instaloader.Post.from_shortcode(L.context, shortcode)
         
         media_list = []
-        if post.typename == 'GraphSidecar':
+        if post.typename == 'GraphSidecar':  # Multi-media / Carousel
             for node in post.get_sidecar_nodes():
                 media_list.append({
                     "type": "video" if node.is_video else "image",
-                    "url": node.video_url if node.is_video else node.display_url
+                    "url": node.video_url if node.is_video else node.display_url,
+                    "thumbnail": node.display_url
                 })
         else:
             media_list.append({
                 "type": "video" if post.is_video else "image",
-                "url": post.video_url if post.is_video else post.url
+                "url": post.video_url if post.is_video else post.url,
+                "thumbnail": post.url
             })
 
         return {
             "type": "post" if len(media_list) > 1 else ("video" if post.is_video else "image"),
             "title": post.caption[:60] if post.caption else f"Instagram_{shortcode}",
-            "author_username": post.owner_username, # ✅ Yaha se hume user ka pata chalega
+            "author_username": post.owner_username,
             "media": media_list
         }
+
     return None
 
 @app.route('/download', methods=['GET'])
 def download_media():
     target_url = request.args.get('url')
+    
     if not target_url:
         return jsonify({"status": "error", "message": "URL parameter missing."}), 400
 
+    u = target_url.lower()
+    if "youtube.com" in u or "youtu.be" in u:
+        return jsonify({"status": "error", "message": "YouTube downloads are not supported."}), 400
+
     platform = detect_platform(target_url)
 
+    # 1. Instagram Custom Handler
     if platform == "Instagram":
         try:
             insta_result = extract_instagram_data(target_url)
@@ -89,31 +107,49 @@ def download_media():
                     "media": insta_result.get("media")
                 })
         except Exception as e:
-            pass
+            pass # Fallback to yt-dlp if instaloader fails
 
-    # yt-dlp Fallback for others
-    ydl_opts = {'format': 'best', 'quiet': True, 'no_warnings': True, 'skip_download': True}
+    # 2. General / Video Handler with yt-dlp
+    ydl_opts = {
+        'format': 'best', 
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        }
+    }
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(target_url, download=False)
             stream_url = info.get('url')
+            
             if not stream_url and 'formats' in info:
                 for fmt in reversed(info['formats']):
                     if fmt.get('url'):
                         stream_url = fmt['url']
                         break
-            if stream_url:
-                return jsonify({
-                    "status": "success",
-                    "platform": platform,
-                    "title": info.get('title', 'Media'),
+
+            if not stream_url:
+                return jsonify({"status": "error", "message": "High Quality link extract nahi ho payi."}), 404
+
+            return jsonify({
+                "status": "success",
+                "platform": platform,
+                "title": info.get('title', 'Downloaded_Media'),
+                "type": "video",
+                "media": [{
                     "type": "video",
-                    "media": [{"type": "video", "url": stream_url}]
-                })
+                    "url": stream_url,
+                    "thumbnail": info.get('thumbnail', '')
+                }]
+            })
+
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# ✅ NAYA ENDPOINT: Username se uski Profile aur Latest Feed nikalne ke liye
+# 3. NAYA ENDPOINT: Crash-proof Profile Feed
 @app.route('/profile_feed', methods=['GET'])
 def get_profile_feed():
     username = request.args.get('username')
@@ -123,7 +159,6 @@ def get_profile_feed():
     try:
         profile = instaloader.Profile.from_username(L.context, username)
         
-        # Profile ki basic details
         user_info = {
             "username": profile.username,
             "full_name": profile.full_name,
@@ -132,23 +167,36 @@ def get_profile_feed():
             "profile_pic": profile.profile_pic_url
         }
 
-        # Latest 6-9 posts fetch karna (zyada karne par ban ho sakta hai)
         recent_posts = []
-        count = 0
-        for post in profile.get_posts():
-            if count >= 6: 
-                break
-            recent_posts.append({
-                "shortcode": post.shortcode,
-                "is_video": post.is_video,
-                "thumbnail": post.url,
-                "link": f"https://www.instagram.com/p/{post.shortcode}/"
-            })
-            count += 1
+        try:
+            # Safe loop: Tries to fetch posts, skips gracefully if blocked by Instagram
+            count = 0
+            for post in profile.get_posts():
+                if count >= 6: 
+                    break
+                recent_posts.append({
+                    "shortcode": post.shortcode,
+                    "is_video": post.is_video,
+                    "thumbnail": post.url,
+                    "link": f"https://www.instagram.com/p/{post.shortcode}/"
+                })
+                count += 1
+        except Exception as post_err:
+            print(f"Posts fetch blocked by Instagram limit: {post_err}") 
+            pass # Keep going and return the profile info at least
             
         return jsonify({"status": "success", "user": user_info, "feed": recent_posts})
+
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({"status": "error", "message": f"Could not fetch profile: {str(e)}"}), 500
+
+@app.route('/', methods=['GET'])
+def health_check():
+    return jsonify({
+        "status": "active",
+        "service": "NexGen Media Downloader API",
+        "supported": ["Instagram", "Facebook", "Twitter", "TikTok", "Pinterest", "Reddit"]
+    })
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
