@@ -1,7 +1,8 @@
 import os
 import uuid
 import glob
-from flask import Flask, request, jsonify, send_file, after_this_request
+import time
+from flask import Flask, request, jsonify, send_file, Response
 from flask_cors import CORS
 import yt_dlp
 
@@ -10,6 +11,16 @@ CORS(app)
 
 DOWNLOAD_DIR = "/tmp/downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+def cleanup_old_files():
+    """Delete files older than 10 minutes to save disk space"""
+    now = time.time()
+    for f in glob.glob(os.path.join(DOWNLOAD_DIR, "*")):
+        if os.stat(f).st_mtime < now - 600:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
 
 def detect_platform(url):
     u = url.lower()
@@ -29,17 +40,18 @@ def detect_platform(url):
 
 @app.route('/download', methods=['GET'])
 def download():
+    cleanup_old_files()
     target_url = request.args.get('url')
     if not target_url:
         return jsonify({"status": "error", "message": "URL parameter missing."}), 400
 
     u = target_url.lower()
     if "youtube.com" in u or "youtu.be" in u:
-        return jsonify({"status": "error", "message": "YouTube downloads are not supported."}), 400
+        return jsonify({"status": "error", "message": "YouTube is not supported."}), 400
 
     platform = detect_platform(target_url)
 
-    # 1. First probe metadata to check if it is an image or video
+    # 1. First probe to detect if it's an image post
     probe_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -56,13 +68,13 @@ def download():
         ext = info.get('ext', '').lower()
         formats = info.get('formats', [])
 
-        # Agar photo post hai (no audio/video streams to merge)
+        # Photo post handling
         if ext in ['jpg', 'jpeg', 'png', 'webp'] or not formats:
             img_url = info.get('url') or info.get('thumbnail')
             return jsonify({
                 "status": "success",
                 "platform": platform,
-                "title": info.get('title', 'Media_Photo'),
+                "title": info.get('title', 'Photo_Post'),
                 "media": [{
                     "type": "image",
                     "url": img_url,
@@ -70,9 +82,9 @@ def download():
                 }]
             })
 
-        # Agar video/reel hai: Server-side download + FFmpeg merge
+        # Video / Reel handling with FFmpeg merge
         unique_id = str(uuid.uuid4())[:8]
-        output_template = os.path.join(DOWNLOAD_DIR, f"{unique_id}_%(title).50s.%(ext)s")
+        output_template = os.path.join(DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
 
         merge_opts = {
             'format': 'bestvideo+bestaudio/best',
@@ -87,17 +99,17 @@ def download():
 
         with yt_dlp.YoutubeDL(merge_opts) as ydl:
             download_info = ydl.extract_info(target_url, download=True)
-            title = download_info.get('title', 'video')
+            title = download_info.get('title', 'Video_Download')
 
-        # Find the merged file on disk
-        matches = glob.glob(os.path.join(DOWNLOAD_DIR, f"{unique_id}_*"))
-        if not matches:
-            return jsonify({"status": "error", "message": "File processing failed."}), 500
+        target_file = os.path.join(DOWNLOAD_DIR, f"{unique_id}.mp4")
+        if not os.path.exists(target_file):
+            matches = glob.glob(os.path.join(DOWNLOAD_DIR, f"{unique_id}.*"))
+            if matches:
+                target_file = matches[0]
+            else:
+                return jsonify({"status": "error", "message": "Failed to merge media streams."}), 500
 
-        file_path = matches[0]
-        file_name = os.path.basename(file_path)
-
-        # Host URL generation for stream endpoint
+        file_name = os.path.basename(target_file)
         base_host = request.host_url.rstrip('/')
         stream_link = f"{base_host}/stream/{file_name}"
 
@@ -119,19 +131,16 @@ def download():
 def stream_file(filename):
     file_path = os.path.join(DOWNLOAD_DIR, filename)
     if not os.path.exists(file_path):
-        return jsonify({"status": "error", "message": "File not found or expired."}), 404
+        return jsonify({"status": "error", "message": "File expired. Please fetch again."}), 404
 
-    @after_this_request
-    def remove_file(response):
-        # Auto clean up file after serving
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        except Exception as e:
-            app.logger.error(f"Error removing file: {e}")
-        return response
-
-    return send_file(file_path, mimetype='video/mp4', as_attachment=False)
+    # Direct attachment for download, inline for video streaming
+    as_attachment = request.args.get('download', '0') == '1'
+    return send_file(
+        file_path, 
+        mimetype='video/mp4', 
+        as_attachment=as_attachment, 
+        download_name=filename
+    )
 
 @app.route('/', methods=['GET'])
 def health():
