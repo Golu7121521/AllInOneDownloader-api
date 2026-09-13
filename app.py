@@ -1,9 +1,15 @@
-from flask import Flask, request, jsonify
+import os
+import uuid
+import glob
+from flask import Flask, request, jsonify, send_file, after_this_request
 from flask_cors import CORS
 import yt_dlp
 
 app = Flask(__name__)
 CORS(app)
+
+DOWNLOAD_DIR = "/tmp/downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 def detect_platform(url):
     u = url.lower()
@@ -21,72 +27,6 @@ def detect_platform(url):
         return "Reddit"
     return "Generic"
 
-def extract_best_media(info):
-    """
-    Extracts best media item ensuring video has both video and audio.
-    Also handles photo posts and carousels.
-    """
-    media_list = []
-
-    # Case 1: Multi-media / Carousel (e.g. multiple photos/videos in a post)
-    if 'entries' in info and info['entries']:
-        for entry in info['entries']:
-            item = parse_single_item(entry)
-            if item:
-                media_list.append(item)
-    else:
-        # Case 2: Single Video or Single Photo
-        item = parse_single_item(info)
-        if item:
-            media_list.append(item)
-
-    return media_list
-
-def parse_single_item(entry):
-    if not entry:
-        return None
-
-    # Check if this item is an image post
-    ext = entry.get('ext', '').lower()
-    formats = entry.get('formats', [])
-    
-    # Check for direct image URL
-    if ext in ['jpg', 'jpeg', 'png', 'webp'] or not formats:
-        img_url = entry.get('url') or entry.get('thumbnail')
-        if img_url:
-            return {
-                "type": "image",
-                "url": img_url,
-                "thumbnail": img_url
-            }
-
-    # If it's a video, ensure audio + video are combined (Fix for No Sound)
-    stream_url = None
-    
-    # 1. Filter formats that have BOTH video and audio
-    audio_video_formats = [
-        f for f in formats 
-        if f.get('vcodec') != 'none' and f.get('acodec') != 'none' and f.get('url')
-    ]
-    
-    if audio_video_formats:
-        # Highest resolution combined format
-        stream_url = audio_video_formats[-1]['url']
-    elif entry.get('url'):
-        stream_url = entry.get('url')
-    elif formats:
-        # Fallback to last available format
-        stream_url = formats[-1].get('url')
-
-    if stream_url:
-        return {
-            "type": "video",
-            "url": stream_url,
-            "thumbnail": entry.get('thumbnail', '')
-        }
-
-    return None
-
 @app.route('/download', methods=['GET'])
 def download():
     target_url = request.args.get('url')
@@ -99,48 +39,103 @@ def download():
 
     platform = detect_platform(target_url)
 
-    ydl_opts = {
+    # 1. First probe metadata to check if it is an image or video
+    probe_opts = {
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
-        'extract_flat': False,
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
     }
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(probe_opts) as ydl:
             info = ydl.extract_info(target_url, download=False)
-            media_items = extract_best_media(info)
 
-            if not media_items:
-                return jsonify({
-                    "status": "error",
-                    "message": "Media extract nahi ho payi. Link check karein."
-                }), 404
+        ext = info.get('ext', '').lower()
+        formats = info.get('formats', [])
 
+        # Agar photo post hai (no audio/video streams to merge)
+        if ext in ['jpg', 'jpeg', 'png', 'webp'] or not formats:
+            img_url = info.get('url') or info.get('thumbnail')
             return jsonify({
                 "status": "success",
                 "platform": platform,
-                "title": info.get('title', 'Media_Download'),
-                "media": media_items
+                "title": info.get('title', 'Media_Photo'),
+                "media": [{
+                    "type": "image",
+                    "url": img_url,
+                    "thumbnail": img_url
+                }]
             })
 
-    except Exception as e:
+        # Agar video/reel hai: Server-side download + FFmpeg merge
+        unique_id = str(uuid.uuid4())[:8]
+        output_template = os.path.join(DOWNLOAD_DIR, f"{unique_id}_%(title).50s.%(ext)s")
+
+        merge_opts = {
+            'format': 'bestvideo+bestaudio/best',
+            'outtmpl': output_template,
+            'merge_output_format': 'mp4',
+            'quiet': True,
+            'no_warnings': True,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+        }
+
+        with yt_dlp.YoutubeDL(merge_opts) as ydl:
+            download_info = ydl.extract_info(target_url, download=True)
+            title = download_info.get('title', 'video')
+
+        # Find the merged file on disk
+        matches = glob.glob(os.path.join(DOWNLOAD_DIR, f"{unique_id}_*"))
+        if not matches:
+            return jsonify({"status": "error", "message": "File processing failed."}), 500
+
+        file_path = matches[0]
+        file_name = os.path.basename(file_path)
+
+        # Host URL generation for stream endpoint
+        base_host = request.host_url.rstrip('/')
+        stream_link = f"{base_host}/stream/{file_name}"
+
         return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
+            "status": "success",
+            "platform": platform,
+            "title": title,
+            "media": [{
+                "type": "video",
+                "url": stream_link,
+                "thumbnail": info.get('thumbnail', '')
+            }]
+        })
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/stream/<filename>', methods=['GET'])
+def stream_file(filename):
+    file_path = os.path.join(DOWNLOAD_DIR, filename)
+    if not os.path.exists(file_path):
+        return jsonify({"status": "error", "message": "File not found or expired."}), 404
+
+    @after_this_request
+    def remove_file(response):
+        # Auto clean up file after serving
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception as e:
+            app.logger.error(f"Error removing file: {e}")
+        return response
+
+    return send_file(file_path, mimetype='video/mp4', as_attachment=False)
 
 @app.route('/', methods=['GET'])
 def health():
-    return jsonify({
-        "status": "active",
-        "service": "All-in-One Media Downloader API",
-        "supported": ["Reels", "Posts (Images/Carousels)", "Facebook", "Twitter", "TikTok", "Reddit"]
-    })
+    return jsonify({"status": "active", "engine": "Docker + FFmpeg Muxer"})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
