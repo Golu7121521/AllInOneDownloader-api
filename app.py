@@ -40,12 +40,12 @@ def download_media():
 
     platform = detect_platform(target_url)
 
-    # Progressive direct MP4 streams for native Android MediaPlayer compatibility
     ydl_opts = {
-        'format': 'best[ext=mp4]/best',
+        'format': 'best',
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
+        'nocheckcertificate': True,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         }
@@ -55,13 +55,13 @@ def download_media():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(target_url, download=False)
 
-            # Check direct URL
+            # Direct URL check
             stream_url = info.get('url')
 
-            # Fallback to formats array if direct URL is not top-level
+            # Fallback to formats array
             if not stream_url and 'formats' in info:
                 for fmt in reversed(info['formats']):
-                    if fmt.get('url') and fmt.get('ext') == 'mp4':
+                    if fmt.get('url'):
                         stream_url = fmt['url']
                         break
 
