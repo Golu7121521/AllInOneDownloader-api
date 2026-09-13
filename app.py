@@ -2,7 +2,8 @@ import os
 import uuid
 import glob
 import time
-from flask import Flask, request, jsonify, send_file, Response
+import re
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import yt_dlp
 
@@ -13,14 +14,14 @@ DOWNLOAD_DIR = "/tmp/downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 def cleanup_old_files():
-    """Delete files older than 10 minutes to save disk space"""
+    """Delete files older than 15 minutes to save disk space"""
     now = time.time()
     for f in glob.glob(os.path.join(DOWNLOAD_DIR, "*")):
-        if os.stat(f).st_mtime < now - 600:
-            try:
+        try:
+            if os.stat(f).st_mtime < now - 900:
                 os.remove(f)
-            except Exception:
-                pass
+        except Exception:
+            pass
 
 def detect_platform(url):
     u = url.lower()
@@ -57,7 +58,7 @@ def download():
         'no_warnings': True,
         'skip_download': True,
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
         }
     }
 
@@ -68,7 +69,7 @@ def download():
         ext = info.get('ext', '').lower()
         formats = info.get('formats', [])
 
-        # Photo post handling
+        # Photo post handling (Images directly served)
         if ext in ['jpg', 'jpeg', 'png', 'webp'] or not formats:
             img_url = info.get('url') or info.get('thumbnail')
             return jsonify({
@@ -82,22 +83,23 @@ def download():
                 }]
             })
 
-        # Video / Reel handling with FFmpeg merge
+        # Video / Reel handling (Preserve 1080p Highest Resolution + Audio)
         unique_id = str(uuid.uuid4())[:8]
         output_template = os.path.join(DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
 
-        merge_opts = {
-            'format': 'bestvideo+bestaudio/best',
+        # 'bv*+ba/b' ensures highest available resolution (1080p) merged with audio
+        download_opts = {
+            'format': 'bv*+ba/b',
             'outtmpl': output_template,
             'merge_output_format': 'mp4',
             'quiet': True,
             'no_warnings': True,
             'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
             }
         }
 
-        with yt_dlp.YoutubeDL(merge_opts) as ydl:
+        with yt_dlp.YoutubeDL(download_opts) as ydl:
             download_info = ydl.extract_info(target_url, download=True)
             title = download_info.get('title', 'Video_Download')
 
@@ -107,7 +109,7 @@ def download():
             if matches:
                 target_file = matches[0]
             else:
-                return jsonify({"status": "error", "message": "Failed to merge media streams."}), 500
+                return jsonify({"status": "error", "message": "Failed to process video."}), 500
 
         file_name = os.path.basename(target_file)
         base_host = request.host_url.rstrip('/')
@@ -127,24 +129,58 @@ def download():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+# Range-capable streaming endpoint (Required for browser audio/video sync)
 @app.route('/stream/<filename>', methods=['GET'])
 def stream_file(filename):
     file_path = os.path.join(DOWNLOAD_DIR, filename)
     if not os.path.exists(file_path):
         return jsonify({"status": "error", "message": "File expired. Please fetch again."}), 404
 
-    # Direct attachment for download, inline for video streaming
-    as_attachment = request.args.get('download', '0') == '1'
-    return send_file(
-        file_path, 
-        mimetype='video/mp4', 
-        as_attachment=as_attachment, 
-        download_name=filename
-    )
+    # Direct file download trigger
+    if request.args.get('download', '0') == '1':
+        with open(file_path, 'rb') as f:
+            data = f.read()
+        return Response(
+            data,
+            mimetype="video/mp4",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Content-Length": str(len(data))
+            }
+        )
+
+    # HTTP Range Request handling for video preview player
+    file_size = os.path.getsize(file_path)
+    range_header = request.headers.get('Range', None)
+
+    if not range_header:
+        with open(file_path, 'rb') as f:
+            data = f.read()
+        return Response(data, mimetype='video/mp4', headers={"Content-Length": str(file_size), "Accept-Ranges": "bytes"})
+
+    byte1, byte2 = 0, None
+    m = re.search(r'bytes=(\d+)-(\d*)', range_header)
+    if m:
+        g = m.groups()
+        byte1 = int(g[0])
+        if g[1]:
+            byte2 = int(g[1])
+
+    length = file_size - byte1 if byte2 is None else byte2 - byte1 + 1
+
+    with open(file_path, 'rb') as f:
+        f.seek(byte1)
+        data = f.read(length)
+
+    rv = Response(data, 206, mimetype='video/mp4', direct_passthrough=True)
+    rv.headers.add('Content-Range', f'bytes {byte1}-{byte1 + len(data) - 1}/{file_size}')
+    rv.headers.add('Accept-Ranges', 'bytes')
+    rv.headers.add('Content-Length', str(len(data)))
+    return rv
 
 @app.route('/', methods=['GET'])
 def health():
-    return jsonify({"status": "active", "engine": "Docker + FFmpeg Muxer"})
+    return jsonify({"status": "active", "engine": "Docker + FFmpeg (1080p Muxer)"})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
