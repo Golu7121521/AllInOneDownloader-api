@@ -1,27 +1,9 @@
-import os
-import uuid
-import glob
-import time
-import re
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import yt_dlp
 
 app = Flask(__name__)
 CORS(app)
-
-DOWNLOAD_DIR = "/tmp/downloads"
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-def cleanup_old_files():
-    """Delete files older than 15 minutes to save disk space"""
-    now = time.time()
-    for f in glob.glob(os.path.join(DOWNLOAD_DIR, "*")):
-        try:
-            if os.stat(f).st_mtime < now - 900:
-                os.remove(f)
-        except Exception:
-            pass
 
 def detect_platform(url):
     u = url.lower()
@@ -39,9 +21,72 @@ def detect_platform(url):
         return "Reddit"
     return "Generic"
 
+def extract_highest_quality(info):
+    """
+    Extracts the absolute highest quality stream or full-res image.
+    Handles single posts as well as multi-item carousels.
+    """
+    media_items = []
+
+    # Multi-item carousel posts
+    if 'entries' in info and info['entries']:
+        for entry in info['entries']:
+            item = parse_media_item(entry)
+            if item:
+                media_items.append(item)
+    else:
+        # Single video / single photo
+        item = parse_media_item(info)
+        if item:
+            media_items.append(item)
+
+    return media_items
+
+def parse_media_item(entry):
+    if not entry:
+        return None
+
+    ext = entry.get('ext', '').lower()
+    formats = entry.get('formats', [])
+
+    # 1. Photo Post (Highest resolution original image)
+    if ext in ['jpg', 'jpeg', 'png', 'webp'] or not formats:
+        img_url = entry.get('url') or entry.get('thumbnail')
+        if img_url:
+            return {
+                "type": "image",
+                "url": img_url,
+                "thumbnail": img_url
+            }
+
+    # 2. Video / Reel (Highest resolution 1080p format)
+    # Sort formats strictly by resolution (height/width) and bitrate
+    best_stream_url = None
+    if formats:
+        # Sort by resolution (height) in descending order to get the top quality
+        sorted_formats = sorted(
+            [f for f in formats if f.get('url')],
+            key=lambda x: (x.get('height') or 0, x.get('width') or 0, x.get('tbr') or 0),
+            reverse=True
+        )
+        if sorted_formats:
+            best_stream_url = sorted_formats[0]['url']
+
+    # Fallback to direct URL if formats array sorting wasn't applicable
+    if not best_stream_url:
+        best_stream_url = entry.get('url')
+
+    if best_stream_url:
+        return {
+            "type": "video",
+            "url": best_stream_url,
+            "thumbnail": entry.get('thumbnail', '')
+        }
+
+    return None
+
 @app.route('/download', methods=['GET'])
 def download():
-    cleanup_old_files()
     target_url = request.args.get('url')
     if not target_url:
         return jsonify({"status": "error", "message": "URL parameter missing."}), 400
@@ -52,134 +97,50 @@ def download():
 
     platform = detect_platform(target_url)
 
-    # 1. Probe metadata (Check for image posts)
-    probe_opts = {
+    # yt-dlp options strictly optimized for MAX quality extraction without server overhead
+    ydl_opts = {
+        'format': 'bestvideo/best',
+        'format_sort': ['res:1080', 'res', 'fps', 'size', 'br'],
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
         }
     }
 
     try:
-        with yt_dlp.YoutubeDL(probe_opts) as ydl:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(target_url, download=False)
+            media_items = extract_highest_quality(info)
 
-        ext = info.get('ext', '').lower()
-        formats = info.get('formats', [])
+            if not media_items:
+                return jsonify({
+                    "status": "error",
+                    "message": "Highest quality stream extract nahi ho payi."
+                }), 404
 
-        # Photo post handling
-        if ext in ['jpg', 'jpeg', 'png', 'webp'] or not formats:
-            img_url = info.get('url') or info.get('thumbnail')
             return jsonify({
                 "status": "success",
                 "platform": platform,
-                "title": info.get('title', 'Photo_Post'),
-                "media": [{
-                    "type": "image",
-                    "url": img_url,
-                    "thumbnail": img_url
-                }]
+                "title": info.get('title', 'Media_Download'),
+                "media": media_items
             })
 
-        # Video / Reel handling (FORCING AUDIO PRIORITY)
-        unique_id = str(uuid.uuid4())[:8]
-        output_template = os.path.join(DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
-
-        download_opts = {
-            # Priority: Video+Audio merge -> Best format that HAS audio -> Fallback
-            'format': 'bestvideo+bestaudio/best[acodec!=none]/best',
-            # Force audio presence BEFORE checking resolution
-            'format_sort': ['hasaud', 'res', 'fps'],
-            'outtmpl': output_template,
-            'merge_output_format': 'mp4',
-            'quiet': True,
-            'no_warnings': True,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-            }
-        }
-
-        with yt_dlp.YoutubeDL(download_opts) as ydl:
-            download_info = ydl.extract_info(target_url, download=True)
-            title = download_info.get('title', 'Video_Download')
-
-        target_file = os.path.join(DOWNLOAD_DIR, f"{unique_id}.mp4")
-        if not os.path.exists(target_file):
-            matches = glob.glob(os.path.join(DOWNLOAD_DIR, f"{unique_id}.*"))
-            if matches:
-                target_file = matches[0]
-            else:
-                return jsonify({"status": "error", "message": "Failed to process video."}), 500
-
-        file_name = os.path.basename(target_file)
-        base_host = request.host_url.rstrip('/')
-        stream_link = f"{base_host}/stream/{file_name}"
-
-        return jsonify({
-            "status": "success",
-            "platform": platform,
-            "title": title,
-            "media": [{
-                "type": "video",
-                "url": stream_link,
-                "thumbnail": info.get('thumbnail', '')
-            }]
-        })
-
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-@app.route('/stream/<filename>', methods=['GET'])
-def stream_file(filename):
-    file_path = os.path.join(DOWNLOAD_DIR, filename)
-    if not os.path.exists(file_path):
-        return jsonify({"status": "error", "message": "File expired. Please fetch again."}), 404
-
-    if request.args.get('download', '0') == '1':
-        with open(file_path, 'rb') as f:
-            data = f.read()
-        return Response(
-            data,
-            mimetype="video/mp4",
-            headers={
-                "Content-Disposition": f"attachment; filename={filename}",
-                "Content-Length": str(len(data))
-            }
-        )
-
-    file_size = os.path.getsize(file_path)
-    range_header = request.headers.get('Range', None)
-
-    if not range_header:
-        with open(file_path, 'rb') as f:
-            data = f.read()
-        return Response(data, mimetype='video/mp4', headers={"Content-Length": str(file_size), "Accept-Ranges": "bytes"})
-
-    byte1, byte2 = 0, None
-    m = re.search(r'bytes=(\d+)-(\d*)', range_header)
-    if m:
-        g = m.groups()
-        byte1 = int(g[0])
-        if g[1]:
-            byte2 = int(g[1])
-
-    length = file_size - byte1 if byte2 is None else byte2 - byte1 + 1
-
-    with open(file_path, 'rb') as f:
-        f.seek(byte1)
-        data = f.read(length)
-
-    rv = Response(data, 206, mimetype='video/mp4', direct_passthrough=True)
-    rv.headers.add('Content-Range', f'bytes {byte1}-{byte1 + len(data) - 1}/{file_size}')
-    rv.headers.add('Accept-Ranges', 'bytes')
-    rv.headers.add('Content-Length', str(len(data)))
-    return rv
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
 
 @app.route('/', methods=['GET'])
 def health():
-    return jsonify({"status": "active", "engine": "Docker + FFmpeg (Audio-First Muxer)"})
+    return jsonify({
+        "status": "active",
+        "service": "Max Quality Media Downloader API",
+        "quality": "Full HD (1080p/Original)"
+    })
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
