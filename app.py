@@ -52,7 +52,7 @@ def download():
 
     platform = detect_platform(target_url)
 
-    # 1. First probe to detect if it's an image post
+    # 1. Probe metadata (Check for image posts)
     probe_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -69,7 +69,7 @@ def download():
         ext = info.get('ext', '').lower()
         formats = info.get('formats', [])
 
-        # Photo post handling (Images directly served)
+        # Photo post handling
         if ext in ['jpg', 'jpeg', 'png', 'webp'] or not formats:
             img_url = info.get('url') or info.get('thumbnail')
             return jsonify({
@@ -83,13 +83,15 @@ def download():
                 }]
             })
 
-        # Video / Reel handling (Preserve 1080p Highest Resolution + Audio)
+        # Video / Reel handling (FORCING AUDIO PRIORITY)
         unique_id = str(uuid.uuid4())[:8]
         output_template = os.path.join(DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
 
-        # 'bv*+ba/b' ensures highest available resolution (1080p) merged with audio
         download_opts = {
-            'format': 'bv*+ba/b',
+            # Priority: Video+Audio merge -> Best format that HAS audio -> Fallback
+            'format': 'bestvideo+bestaudio/best[acodec!=none]/best',
+            # Force audio presence BEFORE checking resolution
+            'format_sort': ['hasaud', 'res', 'fps'],
             'outtmpl': output_template,
             'merge_output_format': 'mp4',
             'quiet': True,
@@ -129,14 +131,12 @@ def download():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# Range-capable streaming endpoint (Required for browser audio/video sync)
 @app.route('/stream/<filename>', methods=['GET'])
 def stream_file(filename):
     file_path = os.path.join(DOWNLOAD_DIR, filename)
     if not os.path.exists(file_path):
         return jsonify({"status": "error", "message": "File expired. Please fetch again."}), 404
 
-    # Direct file download trigger
     if request.args.get('download', '0') == '1':
         with open(file_path, 'rb') as f:
             data = f.read()
@@ -149,7 +149,6 @@ def stream_file(filename):
             }
         )
 
-    # HTTP Range Request handling for video preview player
     file_size = os.path.getsize(file_path)
     range_header = request.headers.get('Range', None)
 
@@ -180,7 +179,7 @@ def stream_file(filename):
 
 @app.route('/', methods=['GET'])
 def health():
-    return jsonify({"status": "active", "engine": "Docker + FFmpeg (1080p Muxer)"})
+    return jsonify({"status": "active", "engine": "Docker + FFmpeg (Audio-First Muxer)"})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
