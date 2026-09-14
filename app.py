@@ -21,35 +21,30 @@ def detect_platform(url):
         return "Reddit"
     return "Generic"
 
-def extract_highest_quality(info):
-    """
-    Extracts the absolute highest quality stream or full-res image.
-    Handles single posts as well as multi-item carousels.
-    """
+def extract_original_quality(info):
     media_items = []
 
-    # Multi-item carousel posts
+    # Carousel/Multiple post items
     if 'entries' in info and info['entries']:
         for entry in info['entries']:
-            item = parse_media_item(entry)
+            item = parse_item(entry)
             if item:
                 media_items.append(item)
     else:
-        # Single video / single photo
-        item = parse_media_item(info)
+        item = parse_item(info)
         if item:
             media_items.append(item)
 
     return media_items
 
-def parse_media_item(entry):
+def parse_item(entry):
     if not entry:
         return None
 
     ext = entry.get('ext', '').lower()
     formats = entry.get('formats', [])
 
-    # 1. Photo Post (Highest resolution original image)
+    # Photo post
     if ext in ['jpg', 'jpeg', 'png', 'webp'] or not formats:
         img_url = entry.get('url') or entry.get('thumbnail')
         if img_url:
@@ -59,20 +54,27 @@ def parse_media_item(entry):
                 "thumbnail": img_url
             }
 
-    # 2. Video / Reel (Highest resolution 1080p format)
-    # Sort formats strictly by resolution (height/width) and bitrate
+    # Video: Pick the absolute largest/highest bitrate stream
     best_stream_url = None
-    if formats:
-        # Sort by resolution (height) in descending order to get the top quality
-        sorted_formats = sorted(
-            [f for f in formats if f.get('url')],
-            key=lambda x: (x.get('height') or 0, x.get('width') or 0, x.get('tbr') or 0),
-            reverse=True
-        )
-        if sorted_formats:
-            best_stream_url = sorted_formats[0]['url']
 
-    # Fallback to direct URL if formats array sorting wasn't applicable
+    if formats:
+        # Filter formats with valid URLs
+        valid_formats = [f for f in formats if f.get('url')]
+
+        # Priority 1: Pick format with largest filesize or highest width/height
+        def get_quality_score(f):
+            # Filesize > Bitrate > Resolution > Height
+            size = f.get('filesize') or f.get('filesize_approx') or 0
+            tbr = f.get('tbr') or 0
+            height = f.get('height') or 0
+            width = f.get('width') or 0
+            return (size, tbr, height * width)
+
+        valid_formats.sort(key=get_quality_score, reverse=True)
+        if valid_formats:
+            best_stream_url = valid_formats[0]['url']
+
+    # Fallback to top-level entry URL (original master stream)
     if not best_stream_url:
         best_stream_url = entry.get('url')
 
@@ -97,10 +99,10 @@ def download():
 
     platform = detect_platform(target_url)
 
-    # yt-dlp options strictly optimized for MAX quality extraction without server overhead
+    # Native sort prioritizing original size & resolution
     ydl_opts = {
         'format': 'bestvideo/best',
-        'format_sort': ['res:1080', 'res', 'fps', 'size', 'br'],
+        'format_sort': ['filesize', 'res', 'fps', 'tbr'],
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
@@ -113,13 +115,10 @@ def download():
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(target_url, download=False)
-            media_items = extract_highest_quality(info)
+            media_items = extract_original_quality(info)
 
             if not media_items:
-                return jsonify({
-                    "status": "error",
-                    "message": "Highest quality stream extract nahi ho payi."
-                }), 404
+                return jsonify({"status": "error", "message": "Media extract nahi ho payi."}), 404
 
             return jsonify({
                 "status": "success",
@@ -129,18 +128,11 @@ def download():
             })
 
     except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/', methods=['GET'])
 def health():
-    return jsonify({
-        "status": "active",
-        "service": "Max Quality Media Downloader API",
-        "quality": "Full HD (1080p/Original)"
-    })
+    return jsonify({"status": "active", "quality": "Original Master Bitrate (Uncompressed)"})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
