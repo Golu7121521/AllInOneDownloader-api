@@ -1,4 +1,6 @@
-from flask import Flask, request, jsonify
+import os
+import tempfile
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import yt_dlp
 
@@ -21,82 +23,6 @@ def detect_platform(url):
         return "Reddit"
     return "Generic"
 
-def extract_original_quality(info):
-    media_items = []
-
-    # Carousel/Multiple post items
-    if 'entries' in info and info['entries']:
-        for entry in info['entries']:
-            item = parse_item(entry)
-            if item:
-                media_items.append(item)
-    else:
-        item = parse_item(info)
-        if item:
-            media_items.append(item)
-
-    return media_items
-
-def parse_item(entry):
-    if not entry:
-        return None
-
-    ext = entry.get('ext', '').lower()
-    formats = entry.get('formats', [])
-
-    # Photo post
-    if ext in ['jpg', 'jpeg', 'png', 'webp'] or not formats:
-        img_url = entry.get('url') or entry.get('thumbnail')
-        if img_url:
-            return {
-                "type": "image",
-                "url": img_url,
-                "thumbnail": img_url
-            }
-
-    # Video: Pick the absolute highest video quality (Resolution > Bitrate > Size)
-    best_stream_url = None
-
-    if formats:
-        # Filter formats with valid URLs
-        valid_formats = [f for f in formats if f.get('url')]
-
-        def get_quality_score(f):
-            # Check if format actually has video
-            has_video = 1 if f.get('vcodec') != 'none' else 0
-            
-            # Resolution is the primary indicator of video quality
-            height = f.get('height') or 0
-            width = f.get('width') or 0
-            resolution = height * width
-            
-            # Secondary indicator: Video Bitrate (vbr) or Total Bitrate (tbr)
-            vbr = f.get('vbr') or f.get('tbr') or 0
-            
-            # Tertiary indicator: Filesize
-            size = f.get('filesize') or f.get('filesize_approx') or 0
-            
-            return (has_video, resolution, vbr, size)
-
-        # Sort reverse so the highest score is at index 0
-        valid_formats.sort(key=get_quality_score, reverse=True)
-        
-        if valid_formats:
-            best_stream_url = valid_formats[0]['url']
-
-    # Fallback to top-level entry URL (original master stream)
-    if not best_stream_url:
-        best_stream_url = entry.get('url')
-
-    if best_stream_url:
-        return {
-            "type": "video",
-            "url": best_stream_url,
-            "thumbnail": entry.get('thumbnail', '')
-        }
-
-    return None
-
 @app.route('/download', methods=['GET'])
 def download():
     target_url = request.args.get('url')
@@ -109,13 +35,19 @@ def download():
 
     platform = detect_platform(target_url)
 
-    # yt-dlp config for absolute best video (ignores audio completely)
+    # Server par ek temporary directory banayenge jahan merged file save hogi
+    temp_dir = tempfile.gettempdir()
+    
+    # yt-dlp Options 
+    # 'bestvideo+bestaudio' ensure karta hai ki highest video (1080p/4k) aur highest audio uthaye.
+    # 'merge_output_format': 'mp4' un dono ko mila kar ek mp4 file bana dega.
     ydl_opts = {
-        'format': 'bestvideo/best',
-        'format_sort': ['res', 'vbr', 'size', 'fps'], # Native yt-dlp sort for best video
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'merge_output_format': 'mp4',
+        'outtmpl': os.path.join(temp_dir, '%(id)s.%(ext)s'),  # Temp folder me file save karega
         'quiet': True,
         'no_warnings': True,
-        'skip_download': True,
+        'skip_download': False,  # Merge karne ke liye server par download karna zaroori hai
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
@@ -124,25 +56,43 @@ def download():
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(target_url, download=False)
-            media_items = extract_original_quality(info)
-
-            if not media_items:
-                return jsonify({"status": "error", "message": "Media extract nahi ho payi."}), 404
-
-            return jsonify({
-                "status": "success",
-                "platform": platform,
-                "title": info.get('title', 'Media_Download'),
-                "media": media_items
-            })
+            # Ye step server par video aur audio download karega aur FFmpeg se merge karega
+            info = ydl.extract_info(target_url, download=True)
+            
+            # File ka original naam / path nikalenge
+            file_path = ydl.prepare_filename(info)
+            base_path, _ = os.path.splitext(file_path)
+            
+            # Kyunki humne mp4 merge ka option diya hai, final extension .mp4 hoga
+            mp4_file_path = base_path + ".mp4"
+            
+            title = info.get('title', 'Media_Download')
+            
+            # Agar successfully merge hokar file ban gayi, toh usey user ko bhej do
+            if os.path.exists(mp4_file_path):
+                return send_file(
+                    mp4_file_path, 
+                    as_attachment=True, 
+                    download_name=f"{title}.mp4",
+                    mimetype='video/mp4'
+                )
+            # Fallback agar direct file wahi rehti hai (merge ki zaroorat nahi padi thi)
+            elif os.path.exists(file_path):
+                return send_file(
+                    file_path, 
+                    as_attachment=True, 
+                    download_name=f"{title}.mp4",
+                    mimetype='video/mp4'
+                )
+            else:
+                return jsonify({"status": "error", "message": "File properly merge nahi ho payi."}), 500
 
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/', methods=['GET'])
 def health():
-    return jsonify({"status": "active", "quality": "Highest Video Quality Only"})
+    return jsonify({"status": "active", "quality": "Highest Video (1080p/2K/4K) + Audio Merged"})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
