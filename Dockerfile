@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# Install system dependencies & FFmpeg
+# Install system dependencies & FFmpeg (Required for video/audio merging)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg curl && \
     rm -rf /var/lib/apt/lists/*
@@ -16,5 +16,6 @@ COPY . .
 
 # Expose port and run via gunicorn
 EXPOSE 5000
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--threads", "4", "--timeout", "120", "app:app"]
 
+# Timeout increased to 300s to allow large 4K/2K files to download and merge successfully
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--threads", "4", "--timeout", "300", "app:app"]
