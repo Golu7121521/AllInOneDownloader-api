@@ -54,23 +54,33 @@ def parse_item(entry):
                 "thumbnail": img_url
             }
 
-    # Video: Pick the absolute largest/highest bitrate stream
+    # Video: Pick the absolute highest video quality (Resolution > Bitrate > Size)
     best_stream_url = None
 
     if formats:
         # Filter formats with valid URLs
         valid_formats = [f for f in formats if f.get('url')]
 
-        # Priority 1: Pick format with largest filesize or highest width/height
         def get_quality_score(f):
-            # Filesize > Bitrate > Resolution > Height
-            size = f.get('filesize') or f.get('filesize_approx') or 0
-            tbr = f.get('tbr') or 0
+            # Check if format actually has video
+            has_video = 1 if f.get('vcodec') != 'none' else 0
+            
+            # Resolution is the primary indicator of video quality
             height = f.get('height') or 0
             width = f.get('width') or 0
-            return (size, tbr, height * width)
+            resolution = height * width
+            
+            # Secondary indicator: Video Bitrate (vbr) or Total Bitrate (tbr)
+            vbr = f.get('vbr') or f.get('tbr') or 0
+            
+            # Tertiary indicator: Filesize
+            size = f.get('filesize') or f.get('filesize_approx') or 0
+            
+            return (has_video, resolution, vbr, size)
 
+        # Sort reverse so the highest score is at index 0
         valid_formats.sort(key=get_quality_score, reverse=True)
+        
         if valid_formats:
             best_stream_url = valid_formats[0]['url']
 
@@ -99,10 +109,10 @@ def download():
 
     platform = detect_platform(target_url)
 
-    # Native sort prioritizing original size & resolution
+    # yt-dlp config for absolute best video (ignores audio completely)
     ydl_opts = {
         'format': 'bestvideo/best',
-        'format_sort': ['filesize', 'res', 'fps', 'tbr'],
+        'format_sort': ['res', 'vbr', 'size', 'fps'], # Native yt-dlp sort for best video
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
@@ -132,7 +142,7 @@ def download():
 
 @app.route('/', methods=['GET'])
 def health():
-    return jsonify({"status": "active", "quality": "Original Master Bitrate (Uncompressed)"})
+    return jsonify({"status": "active", "quality": "Highest Video Quality Only"})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
